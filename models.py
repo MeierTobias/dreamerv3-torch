@@ -173,10 +173,13 @@ class WorldModel(nn.Module):
     # this function is called during both rollout and training
     def preprocess(self, obs):
         obs = {
-            k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
+            k: v.to(device=self._config.device, dtype=torch.float32)
+            if isinstance(v, torch.Tensor)
+            else torch.tensor(v, device=self._config.device, dtype=torch.float32)
             for k, v in obs.items()
         }
-        obs["image"] = obs["image"] / 255.0
+        if "image" in obs:
+            obs["image"] = obs["image"] / 255.0
         if "discount" in obs:
             obs["discount"] *= self._config.discount
             # (batch_size, batch_length) -> (batch_size, batch_length, 1)

@@ -249,6 +249,145 @@ def simulate(
     return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
 
 
+def simulate_vec(
+    agent,
+    env,
+    cache,
+    directory,
+    logger,
+    is_eval=False,
+    limit=None,
+    steps=0,
+    episodes=0,
+    state=None,
+):
+    """Like simulate() but for a vectorized IsaacLab env.
+
+    The env handles all sub-envs in a single batched step on GPU.
+    Data stays as torch tensors until cache insertion.
+    """
+    num_envs = env.num_envs
+    has_image = "image" in env.observation_space.spaces
+
+    # initialize or unpack simulation state
+    if state is None:
+        step, episode = 0, 0
+        done = np.ones(num_envs, bool)
+        length = np.zeros(num_envs, np.int32)
+        obs = None
+        agent_state = None
+        reward = np.zeros(num_envs, np.float32)
+    else:
+        step, episode, done, length, obs, agent_state, reward = state
+
+    # initial reset
+    if obs is None:
+        obs = env.reset()
+        # cache initial observations
+        for i in range(num_envs):
+            t = {k: convert(v[i].cpu().numpy()) for k, v in obs.items()}
+            t["reward"] = 0.0
+            t["discount"] = 1.0
+            add_to_cache(cache, env.ids[i], t)
+
+    while (steps and step < steps) or (episodes and episode < episodes):
+        # stack obs for agent (already batched as torch tensors)
+        obs_agent = {k: v for k, v in obs.items() if "log_" not in k}
+        action, agent_state = agent(obs_agent, done, agent_state)
+        if isinstance(action, dict):
+            act_tensor = action["action"]
+        else:
+            act_tensor = action
+        if not isinstance(act_tensor, torch.Tensor):
+            act_tensor = torch.tensor(act_tensor, device=env._device)
+
+        # remember ids before step (done envs get new ids)
+        prev_ids = list(env.ids)
+
+        # step env
+        obs, reward_t, done_t, info = env.step(act_tensor)
+        done_np = done_t.cpu().numpy()
+        reward = reward_t.cpu().numpy()
+
+        # add transitions to cache
+        for i in range(num_envs):
+            t = {k: convert(v[i].cpu().numpy()) for k, v in obs.items()}
+            if isinstance(action, dict):
+                for k in action:
+                    t[k] = convert(action[k][i].detach().cpu().numpy())
+            else:
+                t["action"] = convert(act_tensor[i].detach().cpu().numpy())
+            t["reward"] = float(reward[i])
+            t["discount"] = float(info["discount"][i].cpu())
+            # use prev_ids: the transition belongs to the episode before auto-reset
+            add_to_cache(cache, prev_ids[i], t)
+
+        episode += int(done_np.sum())
+        length += 1
+        step += num_envs
+        length *= 1 - done_np
+
+        if done_np.any():
+            indices = [index for index, d in enumerate(done_np) if d]
+            for i in indices:
+                ep_id = prev_ids[i]
+                save_episodes(directory, {ep_id: cache[ep_id]})
+                ep_len = len(cache[ep_id]["reward"]) - 1
+                score = float(np.array(cache[ep_id]["reward"]).sum())
+                # record logs given from environments
+                for key in list(cache[ep_id].keys()):
+                    if "log_" in key:
+                        logger.scalar(key, float(np.array(cache[ep_id][key]).sum()))
+                        cache[ep_id].pop(key)
+
+                if not is_eval:
+                    step_in_dataset = erase_over_episodes(cache, limit)
+                    logger.scalar(f"dataset_size", step_in_dataset)
+                    logger.scalar(f"train_return", score)
+                    logger.scalar(f"train_length", ep_len)
+                    logger.scalar(f"train_episodes", len(cache))
+                    logger.write(step=logger.step)
+                else:
+                    if not "eval_lengths" in locals():
+                        eval_lengths = []
+                        eval_scores = []
+                        eval_done = False
+                    eval_scores.append(score)
+                    eval_lengths.append(ep_len)
+                    score = sum(eval_scores) / len(eval_scores)
+                    ep_len = sum(eval_lengths) / len(eval_lengths)
+                    if has_image:
+                        video = cache[ep_id]["image"]
+                        logger.video(f"eval_policy", np.array(video)[None])
+
+                    if len(eval_scores) >= episodes and not eval_done:
+                        logger.scalar(f"eval_return", score)
+                        logger.scalar(f"eval_length", ep_len)
+                        logger.scalar(f"eval_episodes", len(eval_scores))
+                        logger.write(step=logger.step)
+                        eval_done = True
+
+            # cache initial obs for new episodes (auto-reset already happened)
+            for i in indices:
+                t = {k: convert(v[i].cpu().numpy()) for k, v in obs.items()}
+                t["is_first"] = True
+                t["is_terminal"] = False
+                t["reward"] = 0.0
+                t["discount"] = 1.0
+                add_to_cache(cache, env.ids[i], t)
+
+            # update obs so agent sees is_first=True for auto-reset envs
+            obs["is_first"][indices] = True
+            obs["is_terminal"][indices] = False
+
+        done = done_np
+
+    if is_eval:
+        while len(cache) > 1:
+            cache.popitem(last=False)
+    return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
+
+
 def add_to_cache(cache, id, transition):
     if id not in cache:
         cache[id] = dict()
