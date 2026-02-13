@@ -5,8 +5,8 @@
 # and changing the command to `sh -c 'ldconfig -v && nvidia-smi'`.
 #
 # 2. Start training:
-# docker build -f  Dockerfile -t img . && \
-# docker run -it --rm --gpus all -v $PWD:/workspace img \
+# docker build -f  Dockerfile -t dreamerv3-torch:local . && \
+# docker run -it --rm --gpus all -v $PWD:/workspace dreamerv3-torch:local \
 #   sh xvfb_run.sh python3 dreamer.py \
 #   --configs dmc_vision --task dmc_walker_walk \
 #   --logdir "./logdir/dmc_walker_walk"
@@ -20,9 +20,9 @@
 FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=America/San_Francisco
-ENV PYTHONUNBUFFERED 1
-ENV PIP_DISABLE_PIP_VERSION_CHECK 1
-ENV PIP_NO_CACHE_DIR 1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_NO_CACHE_DIR=1
 RUN apt-get update && apt-get install -y \
     vim libgl1-mesa-glx libosmesa6 \
     wget unrar cmake g++ libgl1-mesa-dev \
