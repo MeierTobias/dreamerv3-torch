@@ -1,4 +1,5 @@
 defaults:
+  wandb_project: KLASK
 
   logdir: null
   traindir: null

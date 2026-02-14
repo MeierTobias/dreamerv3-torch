@@ -7,6 +7,7 @@ import pathlib
 import re
 import time
 import random
+import wandb
 
 import numpy as np
 
@@ -55,8 +56,17 @@ class TimeRecording:
 
 
 class Logger:
-    def __init__(self, logdir, step):
+    def __init__(self, logdir, step, config=None):
         self._logdir = logdir
+        self._use_wandb = False
+        if config and getattr(config, "wandb_project", None):
+            wandb.init(
+                project=config.wandb_project,
+                dir=str(logdir),
+                config=vars(config) if hasattr(config, "__dict__") else {},
+            )
+            self._use_wandb = True
+
         self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
         self._last_step = None
         self._last_time = None
@@ -83,6 +93,7 @@ class Logger:
         print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
         with (self._logdir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
+        wlog = {"step": step, **dict(scalars)} if self._use_wandb else None
         for name, value in scalars:
             if "/" not in name:
                 self._writer.add_scalar("scalars/" + name, value, step)
@@ -90,15 +101,23 @@ class Logger:
                 self._writer.add_scalar(name, value, step)
         for name, value in self._images.items():
             self._writer.add_image(name, value, step)
+            if wlog is not None:
+                wlog[name] = wandb.Image(np.array(value))
         for name, value in self._videos.items():
             name = name if isinstance(name, str) else name.decode("utf-8")
             if np.issubdtype(value.dtype, np.floating):
                 value = np.clip(255 * value, 0, 255).astype(np.uint8)
             B, T, H, W, C = value.shape
+            if wlog is not None:
+                wlog[name] = wandb.Video(
+                    value[0].transpose(0, 3, 1, 2), fps=16, format="gif"
+                )
             value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
             self._writer.add_video(name, value, step, 16)
 
         self._writer.flush()
+        if wlog is not None:
+            wandb.log(wlog, commit=True)
         self._scalars = {}
         self._images = {}
         self._videos = {}
