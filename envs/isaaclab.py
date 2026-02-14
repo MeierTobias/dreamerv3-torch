@@ -1,9 +1,70 @@
 import datetime
+import math
 import uuid
 
 import gym
 import numpy as np
 import torch
+
+
+def _torch_gaussian_tolerance(x, bounds=(0.0, 0.0), margin=0.0, value_at_margin=0.1):
+    """Torch equivalent of dm_control's rewards.tolerance with gaussian sigmoid.
+
+    Returns 1 when x falls inside bounds, decays smoothly outside.
+    """
+    lower, upper = bounds
+    in_bounds = (x >= lower) & (x <= upper)
+    if margin == 0:
+        return torch.where(in_bounds, 1.0, 0.0)
+    d = torch.where(x < lower, lower - x, x - upper) / margin
+    # gaussian sigmoid: value_at_margin^(d^2)
+    scale = math.sqrt(-2 * math.log(value_at_margin))
+    value = torch.exp(-0.5 * (d * scale) ** 2)
+    return torch.where(in_bounds, 1.0, value)
+
+
+def _torch_quadratic_tolerance(x, margin=1.0, value_at_margin=0.0):
+    """Torch equivalent of dm_control's tolerance with quadratic sigmoid.
+
+    Returns 1 at x==0, decays quadratically, reaches 0 at margin (when
+    value_at_margin=0).
+    """
+    # scale = sqrt(1 - value_at_margin)
+    scale = math.sqrt(1.0 - value_at_margin)
+    d = torch.abs(x) / margin
+    scaled = d * scale
+    return torch.where(scaled.abs() < 1.0, 1.0 - scaled ** 2, torch.zeros_like(x))
+
+
+def compute_dmc_balance_reward(pole_angle, pole_ang_vel, cart_pos, action):
+    """Compute the exact DMC cartpole balance (smooth) reward in torch.
+
+    This replicates dm_control/suite/cartpole.py  Balance._get_reward(sparse=False):
+        upright = (cos(pole_angle) + 1) / 2
+        centered = (1 + tolerance(cart_pos, margin=2)) / 2
+        small_control = (4 + tolerance(action, margin=1, v@m=0, quadratic)) / 5
+        small_velocity = (1 + tolerance(ang_vel, margin=5)) / 2
+        reward = upright * centered * small_control * small_velocity
+
+    All inputs are (num_envs,) tensors.
+    Returns (num_envs,) tensor with reward in [0, 1].
+    """
+    # upright: (cos(theta) + 1) / 2  --  1 when pole vertical, 0 when inverted
+    upright = (torch.cos(pole_angle) + 1.0) / 2.0
+
+    # centered: gaussian tolerance on cart position, bounds=(0,0), margin=2
+    centered = _torch_gaussian_tolerance(cart_pos, bounds=(0.0, 0.0), margin=2.0)
+    centered = (1.0 + centered) / 2.0
+
+    # small_control: quadratic tolerance on action, margin=1, value_at_margin=0
+    small_control = _torch_quadratic_tolerance(action, margin=1.0, value_at_margin=0.0)
+    small_control = (4.0 + small_control) / 5.0
+
+    # small_velocity: gaussian tolerance on angular vel, bounds=(0,0), margin=5
+    small_velocity = _torch_gaussian_tolerance(pole_ang_vel, bounds=(0.0, 0.0), margin=5.0)
+    small_velocity = (1.0 + small_velocity) / 2.0
+
+    return upright * centered * small_control * small_velocity
 
 
 class IsaacLabVecEnv:
@@ -19,7 +80,9 @@ class IsaacLabVecEnv:
 
     metadata = {}
 
-    def __init__(self, env, obs_key="policy", obs_names=None, image_key=None, size=(64, 64)):
+    def __init__(self, env, obs_key="policy", obs_names=None, image_key=None,
+                 size=(64, 64), reward_fn=None, action_repeat=1,
+                 disable_termination=False, obs_transform=None):
         """
         Args:
             env: IsaacLab DirectRLEnv instance.
@@ -30,17 +93,56 @@ class IsaacLabVecEnv:
             image_key: if set, expose the obs under this key name (e.g. "image")
                 and convert to uint8. Used for vision envs.
             size: target (H, W) for image resize when image_key is set.
+            reward_fn: optional string selecting a custom reward function.
+                "dmc_balance" — exact DMC cartpole balance (smooth) reward.
+                None — use the environment's native reward (default).
+            action_repeat: number of physics sub-steps per agent step. Used to
+                scale the custom reward to match DMC's convention of
+                accumulating reward over action_repeat sub-steps.
+            disable_termination: if True, monkey-patch the underlying env's
+                _get_dones() to never signal early termination. Episodes will
+                only end via time-based truncation, matching DMC behaviour.
+            obs_transform: optional string selecting an observation transform.
+                "dmc_cartpole" — remap IsaacLab's [pole_angle, pole_vel,
+                cart_pos, cart_vel] to DMC's [cart_pos, cos(θ), sin(θ),
+                cart_vel, pole_vel] with matching key names.
+                None — use obs_names as-is (default).
         """
         self._env = env
         self._obs_key = obs_key
         self._obs_names = obs_names
         self._image_key = image_key
         self._size = size
+        self._reward_fn = reward_fn
+        self._action_repeat = action_repeat
+        self._obs_transform = obs_transform
         self._num_envs = env.num_envs
         self._device = env.device
         self._done = torch.ones(self._num_envs, dtype=torch.bool, device=self._device)
         self._is_first = torch.ones(self._num_envs, dtype=torch.bool, device=self._device)
         self._ids = [self._make_id() for _ in range(self._num_envs)]
+
+        if disable_termination:
+            self._patch_no_termination(env)
+
+    @staticmethod
+    def _patch_no_termination(env):
+        """Monkey-patch _get_dones so terminated is always False.
+
+        This makes the env behave like DMC: episodes only end via time-based
+        truncation (max_episode_length), never via early failure. The original
+        _get_dones is kept to still compute time_out correctly.
+        """
+        original_get_dones = env._get_dones
+
+        def _no_termination_get_dones(self):
+            terminated, time_out = original_get_dones()
+            # suppress all early terminations; keep only time-based truncation
+            terminated = torch.zeros_like(terminated)
+            return terminated, time_out
+
+        import types
+        env._get_dones = types.MethodType(_no_termination_get_dones, env)
 
     @property
     def single_obs_shape(self):
@@ -50,7 +152,12 @@ class IsaacLabVecEnv:
     def observation_space(self):
         obs_shape = self.single_obs_shape
         spaces = {}
-        if self._image_key:
+        if self._obs_transform == "dmc_cartpole":
+            # DMC cartpole obs: position(3) = [cart_x, cos(θ), sin(θ)],
+            #                   velocity(2) = [cart_vel, pole_vel]
+            spaces["position"] = gym.spaces.Box(-np.inf, np.inf, (3,), dtype=np.float32)
+            spaces["velocity"] = gym.spaces.Box(-np.inf, np.inf, (2,), dtype=np.float32)
+        elif self._image_key:
             c = obs_shape[-1] if len(obs_shape) == 3 else 3
             spaces[self._image_key] = gym.spaces.Box(
                 0, 255, self._size + (c,), dtype=np.uint8
@@ -92,6 +199,23 @@ class IsaacLabVecEnv:
         obs_dict, reward, terminated, truncated, extras = self._env.step(action)
         done = terminated | truncated
 
+        # override reward with DMC-compatible function if configured
+        if self._reward_fn == "dmc_balance":
+            uw = self._env  # unwrapped DirectRLEnv
+            pole_angle = uw.joint_pos[:, uw._pole_dof_idx[0]]
+            pole_ang_vel = uw.joint_vel[:, uw._pole_dof_idx[0]]
+            cart_pos = uw.joint_pos[:, uw._cart_dof_idx[0]]
+            # action as sent to physics is scaled; get raw [-1,1] action
+            raw_action = action[:, 0] if action.dim() > 1 else action
+            reward = compute_dmc_balance_reward(
+                pole_angle, pole_ang_vel, cart_pos, raw_action
+            )
+            # DMC accumulates the reward over action_repeat physics sub-steps.
+            # IsaacLab computes it once after decimation, so we multiply to
+            # match DMC's scale (approximate: assumes reward is ~constant
+            # across sub-steps, which is true when the pole is balanced).
+            reward = reward * self._action_repeat
+
         obs = self._make_obs(obs_dict, terminated=terminated)
         info = {
             "discount": (~terminated).float(),
@@ -112,7 +236,16 @@ class IsaacLabVecEnv:
     def _make_obs(self, obs_dict, terminated=None):
         raw = obs_dict[self._obs_key]
         obs = {}
-        if self._image_key:
+        if self._obs_transform == "dmc_cartpole":
+            # IsaacLab raw order: [pole_angle, pole_vel, cart_pos, cart_vel]
+            pole_angle = raw[:, 0:1]   # θ in radians
+            pole_vel   = raw[:, 1:2]   # pole angular velocity
+            cart_pos    = raw[:, 2:3]   # cart position
+            cart_vel    = raw[:, 3:4]   # cart velocity
+            # DMC order: position=[cart_x, cos(θ), sin(θ)], velocity=[cart_vel, pole_vel]
+            obs["position"] = torch.cat([cart_pos, torch.cos(pole_angle), torch.sin(pole_angle)], dim=-1)
+            obs["velocity"] = torch.cat([cart_vel, pole_vel], dim=-1)
+        elif self._image_key:
             obs[self._image_key] = self._process_image(raw)
         elif self._obs_names:
             idx = 0

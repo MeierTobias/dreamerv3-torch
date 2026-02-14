@@ -49,11 +49,17 @@ ISAAC_TASKS = {
         "gym_id": "Isaac-Cartpole-Direct-v0",
         "obs_names": {"pole_pos": 1, "pole_vel": 1, "cart_pos": 1, "cart_vel": 1},
         "image_key": None,
+        "reward_fn": "dmc_balance",  # use DMC-compatible reward for comparability
+        "disable_termination": True,  # time-only truncation, like DMC
+        "obs_transform": "dmc_cartpole",  # remap obs to DMC format (cos/sin angle)
     },
     "cartpole_balance_rgb": {
         "gym_id": "Isaac-Cartpole-RGB-Camera-Direct-v0",
         "obs_names": None,
         "image_key": "image",
+        "reward_fn": "dmc_balance",
+        "disable_termination": True,
+        "obs_transform": None,
     },
 }
 
@@ -73,6 +79,9 @@ def make_isaac_env(config):
     gym_id = task_info["gym_id"]
     obs_names = task_info["obs_names"]
     image_key = task_info["image_key"]
+    reward_fn = task_info.get("reward_fn", None)
+    disable_termination = task_info.get("disable_termination", False)
+    obs_transform = task_info.get("obs_transform", None)
 
     num_envs = config.envs
     env_cfg_class = gym.spec(gym_id).kwargs["env_cfg_entry_point"]
@@ -101,6 +110,10 @@ def make_isaac_env(config):
         obs_names=obs_names,
         image_key=image_key,
         size=tuple(config.size),
+        reward_fn=reward_fn,
+        action_repeat=config.action_repeat,
+        disable_termination=disable_termination,
+        obs_transform=obs_transform,
     )
     return vec_env
 
@@ -123,7 +136,7 @@ def main(config):
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step)
+    logger = tools.Logger(logdir, config.action_repeat * step, config)
 
     print("Create envs.")
     if config.offline_traindir:
