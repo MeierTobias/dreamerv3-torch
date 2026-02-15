@@ -113,7 +113,36 @@ class Logger:
                     value[0].transpose(0, 3, 1, 2), fps=16, format="gif"
                 )
             value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-            self._writer.add_video(name, value, step, 16)
+            # moviepy v2 removed moviepy.editor, which TensorBoard's
+            # add_video relies on. Detect this and write the GIF directly.
+            _has_moviepy_editor = True
+            try:
+                from moviepy import editor as _mpy_check  # noqa: F401
+            except ImportError:
+                _has_moviepy_editor = False
+            if _has_moviepy_editor:
+                self._writer.add_video(name, value, step, 16)
+            else:
+                try:
+                    import moviepy
+                    import tempfile, os
+                    from torch.utils.tensorboard.summary import Summary
+                    frames = list(value[0].transpose(1, 2, 3, 0))
+                    clip = moviepy.ImageSequenceClip(frames, fps=16)
+                    tmp = tempfile.NamedTemporaryFile(suffix=".gif", delete=False)
+                    clip.write_gif(tmp.name, logger=None)
+                    with open(tmp.name, "rb") as f:
+                        encoded = f.read()
+                    os.remove(tmp.name)
+                    _, T2, C2, H2, W2 = value.shape
+                    summary_img = Summary.Image(
+                        height=H2, width=W2, colorspace=C2,
+                        encoded_image_string=encoded,
+                    )
+                    summary = Summary(value=[Summary.Value(tag=name, image=summary_img)])
+                    self._writer.file_writer.add_summary(summary, step)
+                except Exception as e:
+                    print(f"Warning: could not log video '{name}': {e}")
 
         self._writer.flush()
         if wlog is not None:
@@ -132,6 +161,11 @@ class Logger:
         self._last_time += duration
         self._last_step = step
         return steps / duration
+
+    def close(self, exit_code=0):
+        self._writer.close()
+        if self._use_wandb:
+            wandb.finish(exit_code=exit_code)
 
     def offline_scalar(self, name, value, step):
         self._writer.add_scalar("scalars/" + name, value, step)
