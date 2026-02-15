@@ -30,11 +30,17 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import functools
+import signal
 
 import gymnasium as gym
 import ruamel.yaml as yaml
 import torch
 from torch import distributions as torchd
+
+# Isaac Sim may override the default SIGINT handler, preventing
+# Python's KeyboardInterrupt from firing on Ctrl+C. Restore it
+# so that try/finally cleanup (wandb.finish, etc.) works properly.
+signal.signal(signal.SIGINT, signal.default_int_handler)
 
 sys.path.append(str(pathlib.Path(__file__).parent))
 
@@ -55,11 +61,11 @@ ISAAC_TASKS = {
     },
     "cartpole_balance_rgb": {
         "gym_id": "Isaac-Cartpole-RGB-Camera-Direct-v0",
-        "obs_names": None,
+        "obs_names": {"pole_pos": 1, "pole_vel": 1, "cart_pos": 1, "cart_vel": 1},
         "image_key": "image",
         "reward_fn": "dmc_balance",
         "disable_termination": True,
-        "obs_transform": None,
+        "obs_transform": "dmc_cartpole",
     },
 }
 
@@ -89,6 +95,7 @@ def make_isaac_env(config):
     if isinstance(env_cfg_class, str):
         module_name, class_name = env_cfg_class.rsplit(":", 1)
         import importlib
+
         mod = importlib.import_module(module_name)
         env_cfg_class = getattr(mod, class_name)
 
@@ -101,6 +108,10 @@ def make_isaac_env(config):
 
     if hasattr(env_cfg, "tiled_camera"):
         render_mode = "rgb_array"
+        # match DMC: render at the exact target resolution so no resize is
+        # needed (DMC renders directly into a 64x64 framebuffer).
+        env_cfg.tiled_camera.width = config.size[1]
+        env_cfg.tiled_camera.height = config.size[0]
     else:
         render_mode = None
 
@@ -205,49 +216,54 @@ def main(config):
         agent._should_pretrain._once = False
 
     # make sure eval will be executed once after config.steps
-    while agent._step < config.steps + config.eval_every:
-        logger.write()
-        if config.eval_episode_num > 0:
-            print("Start evaluation.")
-            eval_policy = functools.partial(agent, training=False)
-            tools.simulate_vec(
-                eval_policy,
-                eval_env,
-                eval_eps,
-                config.evaldir,
+    try:
+        while agent._step < config.steps + config.eval_every:
+            logger.write()
+            if config.eval_episode_num > 0:
+                print("Start evaluation.")
+                eval_policy = functools.partial(agent, training=False)
+                tools.simulate_vec(
+                    eval_policy,
+                    eval_env,
+                    eval_eps,
+                    config.evaldir,
+                    logger,
+                    is_eval=True,
+                    episodes=config.eval_episode_num,
+                )
+                if config.video_pred_log:
+                    video_pred = agent._wm.video_pred(next(eval_dataset))
+                    logger.video("eval_openl", tools.to_np(video_pred))
+            print("Start training.")
+            state = tools.simulate_vec(
+                agent,
+                train_env,
+                train_eps,
+                config.traindir,
                 logger,
-                is_eval=True,
-                episodes=config.eval_episode_num,
+                limit=config.dataset_size,
+                steps=config.eval_every,
+                state=state,
             )
-            if config.video_pred_log:
-                video_pred = agent._wm.video_pred(next(eval_dataset))
-                logger.video("eval_openl", tools.to_np(video_pred))
-        print("Start training.")
-        state = tools.simulate_vec(
-            agent,
-            train_env,
-            train_eps,
-            config.traindir,
-            logger,
-            limit=config.dataset_size,
-            steps=config.eval_every,
-            state=state,
-        )
-        items_to_save = {
-            "agent_state_dict": agent.state_dict(),
-            "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
-        }
-        torch.save(items_to_save, logdir / "latest.pt")
+            items_to_save = {
+                "agent_state_dict": agent.state_dict(),
+                "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+            }
+            torch.save(items_to_save, logdir / "latest.pt")
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.")
+        logger.close(exit_code=1)
+        train_env.close()
+        return
 
+    logger.close()
     train_env.close()
 
 
 if __name__ == "__main__":
     # load dreamer configs
     _yaml = yaml.YAML(typ="safe", pure=True)
-    configs = _yaml.load(
-        (pathlib.Path(__file__).parent / "configs.yaml").read_text()
-    )
+    configs = _yaml.load((pathlib.Path(__file__).parent / "configs.yaml").read_text())
 
     def recursive_update(base, update):
         for key, value in update.items():

@@ -402,6 +402,13 @@ def simulate_vec(
         done = done_np
 
     if is_eval:
+        # Keep only one *completed* episode for video_pred.
+        # Auto-reset stubs (1-step initial obs) must be removed first,
+        # otherwise the trim would leave only a stub and sample_episodes
+        # would spin forever on the total < 2 check.
+        for key in list(cache.keys()):
+            if len(cache[key]["reward"]) < 2:
+                del cache[key]
         while len(cache) > 1:
             cache.popitem(last=False)
     return (step - steps, episode - episodes, done, length, obs, agent_state, reward)

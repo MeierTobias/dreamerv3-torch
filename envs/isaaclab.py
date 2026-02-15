@@ -33,7 +33,7 @@ def _torch_quadratic_tolerance(x, margin=1.0, value_at_margin=0.0):
     scale = math.sqrt(1.0 - value_at_margin)
     d = torch.abs(x) / margin
     scaled = d * scale
-    return torch.where(scaled.abs() < 1.0, 1.0 - scaled ** 2, torch.zeros_like(x))
+    return torch.where(scaled.abs() < 1.0, 1.0 - scaled**2, torch.zeros_like(x))
 
 
 def compute_dmc_balance_reward(pole_angle, pole_ang_vel, cart_pos, action):
@@ -61,7 +61,9 @@ def compute_dmc_balance_reward(pole_angle, pole_ang_vel, cart_pos, action):
     small_control = (4.0 + small_control) / 5.0
 
     # small_velocity: gaussian tolerance on angular vel, bounds=(0,0), margin=5
-    small_velocity = _torch_gaussian_tolerance(pole_ang_vel, bounds=(0.0, 0.0), margin=5.0)
+    small_velocity = _torch_gaussian_tolerance(
+        pole_ang_vel, bounds=(0.0, 0.0), margin=5.0
+    )
     small_velocity = (1.0 + small_velocity) / 2.0
 
     return upright * centered * small_control * small_velocity
@@ -80,9 +82,18 @@ class IsaacLabVecEnv:
 
     metadata = {}
 
-    def __init__(self, env, obs_key="policy", obs_names=None, image_key=None,
-                 size=(64, 64), reward_fn=None, action_repeat=1,
-                 disable_termination=False, obs_transform=None):
+    def __init__(
+        self,
+        env,
+        obs_key="policy",
+        obs_names=None,
+        image_key=None,
+        size=(64, 64),
+        reward_fn=None,
+        action_repeat=1,
+        disable_termination=False,
+        obs_transform=None,
+    ):
         """
         Args:
             env: IsaacLab DirectRLEnv instance.
@@ -119,7 +130,9 @@ class IsaacLabVecEnv:
         self._num_envs = env.num_envs
         self._device = env.device
         self._done = torch.ones(self._num_envs, dtype=torch.bool, device=self._device)
-        self._is_first = torch.ones(self._num_envs, dtype=torch.bool, device=self._device)
+        self._is_first = torch.ones(
+            self._num_envs, dtype=torch.bool, device=self._device
+        )
         self._ids = [self._make_id() for _ in range(self._num_envs)]
 
         if disable_termination:
@@ -142,6 +155,7 @@ class IsaacLabVecEnv:
             return terminated, time_out
 
         import types
+
         env._get_dones = types.MethodType(_no_termination_get_dones, env)
 
     @property
@@ -152,23 +166,30 @@ class IsaacLabVecEnv:
     def observation_space(self):
         obs_shape = self.single_obs_shape
         spaces = {}
+
+        # --- state observations ---
         if self._obs_transform == "dmc_cartpole":
             # DMC cartpole obs: position(3) = [cart_x, cos(θ), sin(θ)],
             #                   velocity(2) = [cart_vel, pole_vel]
             spaces["position"] = gym.spaces.Box(-np.inf, np.inf, (3,), dtype=np.float32)
             spaces["velocity"] = gym.spaces.Box(-np.inf, np.inf, (2,), dtype=np.float32)
-        elif self._image_key:
-            c = obs_shape[-1] if len(obs_shape) == 3 else 3
-            spaces[self._image_key] = gym.spaces.Box(
-                0, 255, self._size + (c,), dtype=np.uint8
-            )
         elif self._obs_names:
             for name, dim in self._obs_names.items():
                 spaces[name] = gym.spaces.Box(-np.inf, np.inf, (dim,), dtype=np.float32)
         else:
-            spaces["obs"] = gym.spaces.Box(
-                -np.inf, np.inf, obs_shape, dtype=np.float32
+            # fallback: expose the raw vector unless we only have an image
+            if not self._image_key:
+                spaces["obs"] = gym.spaces.Box(
+                    -np.inf, np.inf, obs_shape, dtype=np.float32
+                )
+
+        # --- image observation (additive, not exclusive) ---
+        if self._image_key:
+            c = obs_shape[-1] if len(obs_shape) == 3 else 3
+            spaces[self._image_key] = gym.spaces.Box(
+                0, 255, self._size + (c,), dtype=np.uint8
             )
+
         spaces["is_first"] = gym.spaces.Box(0, 1, (), dtype=bool)
         spaces["is_terminal"] = gym.spaces.Box(0, 1, (), dtype=bool)
         return gym.spaces.Dict(spaces)
@@ -190,7 +211,9 @@ class IsaacLabVecEnv:
 
     def reset(self):
         obs_dict, _ = self._env.reset()
-        self._is_first = torch.ones(self._num_envs, dtype=torch.bool, device=self._device)
+        self._is_first = torch.ones(
+            self._num_envs, dtype=torch.bool, device=self._device
+        )
         self._done = torch.zeros(self._num_envs, dtype=torch.bool, device=self._device)
         self._ids = [self._make_id() for _ in range(self._num_envs)]
         return self._make_obs(obs_dict)
@@ -236,24 +259,46 @@ class IsaacLabVecEnv:
     def _make_obs(self, obs_dict, terminated=None):
         raw = obs_dict[self._obs_key]
         obs = {}
+
+        # --- state observations ---
         if self._obs_transform == "dmc_cartpole":
-            # IsaacLab raw order: [pole_angle, pole_vel, cart_pos, cart_vel]
-            pole_angle = raw[:, 0:1]   # θ in radians
-            pole_vel   = raw[:, 1:2]   # pole angular velocity
-            cart_pos    = raw[:, 2:3]   # cart position
-            cart_vel    = raw[:, 3:4]   # cart velocity
+            # Read state from the joint data directly. In the RGB camera env
+            # obs_dict["policy"] is the image, NOT the state vector, so we
+            # must never slice `raw` for scalar joint quantities.
+            uw = self._env  # unwrapped DirectRLEnv
+            pole_angle = uw.joint_pos[:, uw._pole_dof_idx[0]].unsqueeze(-1)
+            pole_vel = uw.joint_vel[:, uw._pole_dof_idx[0]].unsqueeze(-1)
+            cart_pos = uw.joint_pos[:, uw._cart_dof_idx[0]].unsqueeze(-1)
+            cart_vel = uw.joint_vel[:, uw._cart_dof_idx[0]].unsqueeze(-1)
             # DMC order: position=[cart_x, cos(θ), sin(θ)], velocity=[cart_vel, pole_vel]
-            obs["position"] = torch.cat([cart_pos, torch.cos(pole_angle), torch.sin(pole_angle)], dim=-1)
+            obs["position"] = torch.cat(
+                [cart_pos, torch.cos(pole_angle), torch.sin(pole_angle)], dim=-1
+            )
             obs["velocity"] = torch.cat([cart_vel, pole_vel], dim=-1)
-        elif self._image_key:
-            obs[self._image_key] = self._process_image(raw)
         elif self._obs_names:
             idx = 0
             for name, dim in self._obs_names.items():
                 obs[name] = raw[:, idx : idx + dim]
                 idx += dim
         else:
-            obs["obs"] = raw
+            # fallback: expose the raw vector unless we only have an image
+            if not self._image_key:
+                obs["obs"] = raw
+
+        # --- image observation (additive, not exclusive) ---
+        if self._image_key:
+            # For the DMC cartpole comparison we read raw uint8 directly from
+            # the tiled camera buffer, because the env's _get_observations()
+            # normalises the image (/255 and subtracts spatial mean) which
+            # corrupts it for DreamerV3 (whose preprocess() expects raw uint8).
+            # For all other envs, use the obs dict and let _process_image
+            # handle the dtype conversion.
+            if self._reward_fn == "dmc_balance":
+                raw_rgb = self._env._tiled_camera.data.output["rgb"]
+                obs[self._image_key] = self._process_image(raw_rgb)
+            else:
+                obs[self._image_key] = self._process_image(raw)
+
         obs["is_first"] = self._is_first
         if terminated is not None:
             obs["is_terminal"] = terminated
@@ -264,17 +309,19 @@ class IsaacLabVecEnv:
         return obs
 
     def _process_image(self, raw):
-        # IsaacLab camera: (N, H, W, C) float normalized or (N, H, W, C) uint8
+        # Convert to uint8 if the source provides float32 (e.g. [0,1] range)
         if raw.dtype == torch.float32:
-            img = (raw.clamp(0, 1) * 255).to(torch.uint8)
+            img = (raw.clamp(0.0, 1.0) * 255).to(torch.uint8)
         else:
             img = raw
-        # resize if needed
+        # resize if needed to match config.size (e.g. 64x64)
         h, w = self._size
         if img.shape[1] != h or img.shape[2] != w:
             # (N,H,W,C) -> (N,C,H,W) for interpolate, then back
             img = img.permute(0, 3, 1, 2).float()
-            img = torch.nn.functional.interpolate(img, size=(h, w), mode="bilinear", align_corners=False)
+            img = torch.nn.functional.interpolate(
+                img, size=(h, w), mode="bilinear", align_corners=False
+            )
             img = img.permute(0, 2, 3, 1).to(torch.uint8)
         return img
 
