@@ -112,6 +112,16 @@ def make_isaac_env(config):
         # needed (DMC renders directly into a 64x64 framebuffer).
         env_cfg.tiled_camera.width = config.size[1]
         env_cfg.tiled_camera.height = config.size[0]
+        # Disable anti-aliasing to match DMC's raw OpenGL rasteriser.
+        # IsaacLab defaults to DLSS which smooths the image significantly.
+        from isaaclab.sim import RenderCfg
+
+        env_cfg.sim.render = RenderCfg(antialiasing_mode="Off")
+        if task == "cartpole_balance_rgb":
+            # DMC's fixed camera: pos="0 -4 1" (4m back, cart height).
+            # IsaacLab cart is at z=2.0, camera looks along +X, so the
+            # equivalent is (-4, 0, 2).  Default was (-5, 0, 2).
+            env_cfg.tiled_camera.offset.pos = (-4.0, 0.0, 2.0)
     else:
         render_mode = None
 
@@ -126,6 +136,13 @@ def make_isaac_env(config):
         disable_termination=disable_termination,
         obs_transform=obs_transform,
     )
+
+    # For the vision cartpole task, override scene colours to match DMC.
+    # This must happen after gym.make (scene exists) but before training
+    # starts collecting frames.
+    if task == "cartpole_balance_rgb":
+        IsaacLabVecEnv.apply_dmc_cartpole_colors(isaac_env.unwrapped)
+
     return vec_env
 
 

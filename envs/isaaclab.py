@@ -325,6 +325,72 @@ class IsaacLabVecEnv:
             img = img.permute(0, 2, 3, 1).to(torch.uint8)
         return img
 
+    @staticmethod
+    def apply_dmc_cartpole_colors(env):
+        """Override cart/pole/slider/light colors to match DMC cartpole visuals.
+
+        Must be called after the scene has been created and the simulation
+        has been started (i.e. after ``gym.make``). Only touches env_0's
+        prims — replicate_physics mirrors them to all other envs.
+
+        DMC cartpole colours (linear RGB):
+          - cart & pole ("self" material):     (0.89, 0.65, 0.41)  warm brown
+          - slider / rail ("decoration"):      (0.24, 0.47, 0.61)  steel blue
+          - dome light → approximate sky:      (0.18, 0.28, 0.37)  blue sky
+          - ground plane:                      (0.04, 0.20, 0.31) dark blue-grey
+        """
+        import isaaclab.sim as sim_utils
+
+        # ---- create materials under /World/Looks ----
+        self_mat_cfg = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.89, 0.65, 0.41), roughness=0.6, metallic=0.0)
+        deco_mat_cfg = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.24, 0.47, 0.61), roughness=0.6, metallic=0.0)
+        self_mat_path = "/World/Looks/DmcSelf"
+        deco_mat_path = "/World/Looks/DmcDecoration"
+
+        sim_utils.spawn_preview_surface(self_mat_path, self_mat_cfg)
+        sim_utils.spawn_preview_surface(deco_mat_path, deco_mat_cfg)
+
+        # ---- bind materials to cart, pole, slider ----
+        # Bind to the Xform parent (stronger_than_descendants) so all child
+        # visuals/meshes inherit the material.
+        env0 = "/World/envs/env_0/Robot"
+        for part in ("cart", "pole"):
+            sim_utils.bind_visual_material(f"{env0}/{part}", self_mat_path, stronger_than_descendants=True)
+        sim_utils.bind_visual_material(f"{env0}/slider", deco_mat_path, stronger_than_descendants=True)
+
+        # ---- dome light → DMC-like sky colour ----
+        stage = sim_utils.get_current_stage()
+        light_prim = stage.GetPrimAtPath("/World/Light")
+        if light_prim.IsValid():
+            from pxr import Gf
+
+            light_prim.GetAttribute("inputs:color").Set(Gf.Vec3f(0.18, 0.28, 0.37))
+            # DMC uses headlight diffuse=0.8 + ambient=0.4, much dimmer than
+            # IsaacLab's default 2000. Lower intensity to approximate DMC.
+            light_prim.GetAttribute("inputs:intensity").Set(500.0)
+            # Make the dome visible as background colour.
+            vis_attr = light_prim.GetAttribute("visibleInPrimaryRay")
+            if vis_attr:
+                vis_attr.Set(True)
+
+        # ---- ground plane ----
+        # The cartpole scene has no explicit ground plane prim. We create a
+        # large flat box beneath the cart (cart sits at z=2.0) to serve as
+        # the floor with the dark blue-grey DMC ground colour.
+        ground_cfg = sim_utils.CuboidCfg(
+            size=(40.0, 40.0, 0.01),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.04, 0.20, 0.31),
+                roughness=0.8,
+                metallic=0.0,
+            ),
+        )
+        ground_cfg.func(
+            "/World/DmcGround",
+            ground_cfg,
+            translation=(0.0, 0.0, -0.005),
+        )
+
     def close(self):
         self._env.close()
 
