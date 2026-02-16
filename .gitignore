@@ -136,3 +136,6 @@ dmypy.json
 
 # VScode
 .vscode/*
+
+# Weights and Biases logs
+/wandb
