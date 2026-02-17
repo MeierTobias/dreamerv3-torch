@@ -4,10 +4,13 @@ Launch IsaacSim before any IsaacLab imports, then run the dreamer training
 loop using a vectorized IsaacLab environment.
 
 Usage:
-  python dreamer_isaaclab.py --configs isaac_proprio --task isaac_cartpole_balance --logdir ./logdir/isaac_proprio/isaac_cartpole_balance
+  python dreamer_isaaclab.py --configs isaac_proprio --task isaac_cartpole_balance --logdir /workspace/dreamerv3-torch/logdir/isaac_proprio/isaac_cartpole_balance
 
   And to see the progress with TensorBoard:
-  tensorboard --logdir ./logdir/isaac_proprio/isaac_cartpole_balance/
+  tensorboard --logdir /workspace/dreamerv3-torch/logdir/isaac_proprio/isaac_cartpole_balance/
+
+  or
+  python dreamer_isaaclab.py --configs isaac_vision --task isaac_cartpole_balance_rgb --enable_cameras --logdir /workspace/dreamerv3-torch/logdir/isaac_vision/isaac_cartpole_balance_rgb
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -251,6 +254,7 @@ def main(config):
                 if config.video_pred_log:
                     video_pred = agent._wm.video_pred(next(eval_dataset))
                     logger.video("eval_openl", tools.to_np(video_pred))
+                state = None
             print("Start training.")
             state = tools.simulate_vec(
                 agent,
