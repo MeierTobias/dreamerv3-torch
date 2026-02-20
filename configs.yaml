@@ -183,8 +183,8 @@ isaac_proprio:
   envs: 4
   train_ratio: 512
   video_pred_log: false
-  encoder: {mlp_keys: '.*', cnn_keys: '$^'}
-  decoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  encoder: { mlp_keys: 'policy', cnn_keys: '$^' }
+  decoder: { mlp_keys: 'policy', cnn_keys: '$^' }
 
 isaac_vision:
   steps: 5e5
@@ -192,8 +192,8 @@ isaac_vision:
   envs: 4
   train_ratio: 512
   video_pred_log: true
-  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
-  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
+  encoder: { mlp_keys: '$^', cnn_keys: 'image' }
+  decoder: { mlp_keys: '$^', cnn_keys: 'image' }
 
 debug:
   debug: True

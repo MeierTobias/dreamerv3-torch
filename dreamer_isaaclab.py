@@ -50,25 +50,56 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 import models
 import tools
 from envs.isaaclab import IsaacLabVecEnv
+from envs.isaac_cartpole_overrides import (
+    patch_dmc_cartpole_reward,
+    patch_dmc_cartpole_obs,
+    patch_no_termination,
+    apply_dmc_cartpole_colors,
+)
 from dreamer import Dreamer, count_steps, make_dataset
 
-# task name -> (gym_id, obs_names_dict_or_None)
+# task name -> task configuration dict
+# Each entry can specify:
+#   gym_id           - registered gymnasium env id
+#   pre_wrap_fns     - list of callable(unwrapped_env, config) to patch env before wrapping
+#   post_create_fn   - callable(unwrapped_env) to run after gym.make (e.g. colours)
+#   env_cfg_fn       - callable(env_cfg, task, config) to customise env_cfg
+
+
+def _cartpole_env_cfg_fn(env_cfg, task, config):
+    """Customise env_cfg for the DMC cartpole benchmark camera variant."""
+    if task == "cartpole_balance_rgb" and hasattr(env_cfg, "tiled_camera"):
+        # DMC's fixed camera: pos="0 -4 1" (4m back, cart height).
+        # IsaacLab cart is at z=2.0, camera looks along +X, so the
+        # equivalent is (-4, 0, 2).  Default was (-5, 0, 2).
+        env_cfg.tiled_camera.offset.pos = (-4.0, 0.0, 2.0)
+
+
+def _patch_cartpole_reward(env, config):
+    """Pre-wrap callback: patch reward with action_repeat from config."""
+    patch_dmc_cartpole_reward(env, config.action_repeat)
+
+
+def _patch_cartpole_obs(env, config):
+    patch_dmc_cartpole_obs(env)
+
+
+def _patch_no_term(env, config):
+    patch_no_termination(env)
+
+
 ISAAC_TASKS = {
     "cartpole_balance": {
         "gym_id": "Isaac-Cartpole-Direct-v0",
-        "obs_names": {"pole_pos": 1, "pole_vel": 1, "cart_pos": 1, "cart_vel": 1},
-        "image_key": None,
-        "reward_fn": "dmc_balance",  # use DMC-compatible reward for comparability
-        "disable_termination": True,  # time-only truncation, like DMC
-        "obs_transform": "dmc_cartpole",  # remap obs to DMC format (cos/sin angle)
+        "pre_wrap_fns": [_patch_no_term, _patch_cartpole_reward, _patch_cartpole_obs],
+        "post_create_fn": None,
+        "env_cfg_fn": None,
     },
     "cartpole_balance_rgb": {
         "gym_id": "Isaac-Cartpole-RGB-Camera-Direct-v0",
-        "obs_names": {"pole_pos": 1, "pole_vel": 1, "cart_pos": 1, "cart_vel": 1},
-        "image_key": "image",
-        "reward_fn": "dmc_balance",
-        "disable_termination": True,
-        "obs_transform": "dmc_cartpole",
+        "pre_wrap_fns": [_patch_no_term, _patch_cartpole_reward, _patch_cartpole_obs],
+        "post_create_fn": apply_dmc_cartpole_colors,
+        "env_cfg_fn": _cartpole_env_cfg_fn,
     },
 }
 
@@ -85,12 +116,11 @@ def make_isaac_env(config):
     if not task_info:
         avail = ", ".join(f"isaac_{k}" for k in ISAAC_TASKS)
         raise ValueError(f"Unknown isaac task 'isaac_{task}'. Available: {avail}")
+
     gym_id = task_info["gym_id"]
-    obs_names = task_info["obs_names"]
-    image_key = task_info["image_key"]
-    reward_fn = task_info.get("reward_fn", None)
-    disable_termination = task_info.get("disable_termination", False)
-    obs_transform = task_info.get("obs_transform", None)
+    pre_wrap_fns = task_info.get("pre_wrap_fns", [])
+    post_create_fn = task_info.get("post_create_fn")
+    env_cfg_fn = task_info.get("env_cfg_fn")
 
     num_envs = config.envs
     env_cfg_class = gym.spec(gym_id).kwargs["env_cfg_entry_point"]
@@ -111,40 +141,29 @@ def make_isaac_env(config):
 
     if hasattr(env_cfg, "tiled_camera"):
         render_mode = "rgb_array"
-        # match DMC: render at the exact target resolution so no resize is
-        # needed (DMC renders directly into a 64x64 framebuffer).
         env_cfg.tiled_camera.width = config.size[1]
         env_cfg.tiled_camera.height = config.size[0]
-        # Disable anti-aliasing to match DMC's raw OpenGL rasteriser.
-        # IsaacLab defaults to DLSS which smooths the image significantly.
         from isaaclab.sim import RenderCfg
 
         env_cfg.sim.render = RenderCfg(antialiasing_mode="Off")
-        if task == "cartpole_balance_rgb":
-            # DMC's fixed camera: pos="0 -4 1" (4m back, cart height).
-            # IsaacLab cart is at z=2.0, camera looks along +X, so the
-            # equivalent is (-4, 0, 2).  Default was (-5, 0, 2).
-            env_cfg.tiled_camera.offset.pos = (-4.0, 0.0, 2.0)
     else:
         render_mode = None
 
-    isaac_env = gym.make(gym_id, cfg=env_cfg, render_mode=render_mode)
-    vec_env = IsaacLabVecEnv(
-        isaac_env.unwrapped,
-        obs_names=obs_names,
-        image_key=image_key,
-        size=tuple(config.size),
-        reward_fn=reward_fn,
-        action_repeat=config.action_repeat,
-        disable_termination=disable_termination,
-        obs_transform=obs_transform,
-    )
+    # apply task-specific env_cfg customisations (e.g. camera position)
+    if env_cfg_fn is not None:
+        env_cfg_fn(env_cfg, task, config)
 
-    # For the vision cartpole task, override scene colours to match DMC.
-    # This must happen after gym.make (scene exists) but before training
-    # starts collecting frames.
-    if task == "cartpole_balance_rgb":
-        IsaacLabVecEnv.apply_dmc_cartpole_colors(isaac_env.unwrapped)
+    isaac_env = gym.make(gym_id, cfg=env_cfg, render_mode=render_mode)
+
+    # apply pre-wrap patches (e.g. disable termination, remap observations)
+    for fn in pre_wrap_fns:
+        fn(isaac_env.unwrapped, config)
+
+    # apply post-create customisations (e.g. scene colours)
+    if post_create_fn is not None:
+        post_create_fn(isaac_env.unwrapped)
+
+    vec_env = IsaacLabVecEnv(isaac_env.unwrapped)
 
     return vec_env
 
