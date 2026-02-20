@@ -139,3 +139,6 @@ dmypy.json
 
 # Weights and Biases logs
 /wandb
+
+# Data files
+/${data}
