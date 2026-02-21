@@ -29,19 +29,21 @@ class IsaacLabVecEnv:
     def __init__(self, env):
         """
         Args:
-            env: IsaacLab DirectRLEnv instance (already unwrapped).
+            env: IsaacLab env instance, possibly wrapped with gymnasium Wrappers.
         """
         self._env = env
-        self._num_envs = env.num_envs
-        self._device = env.device
+        unwrapped = env.unwrapped if hasattr(env, "unwrapped") else env
+        self._num_envs = unwrapped.num_envs
+        self._device = unwrapped.device
         self._done = torch.ones(self._num_envs, dtype=torch.bool, device=self._device)
         self._is_first = torch.ones(self._num_envs, dtype=torch.bool, device=self._device)
         self._ids = [self._make_id() for _ in range(self._num_envs)]
 
     @property
     def observation_space(self):
+        unwrapped = self._env.unwrapped if hasattr(self._env, "unwrapped") else self._env
         spaces = {}
-        for key, box in self._env.single_observation_space.spaces.items():
+        for key, box in unwrapped.single_observation_space.spaces.items():
             spaces[key] = gym.spaces.Box(
                 low=float(box.low.flat[0]),
                 high=float(box.high.flat[0]),
@@ -54,7 +56,8 @@ class IsaacLabVecEnv:
 
     @property
     def action_space(self):
-        space = self._env.single_action_space
+        unwrapped = self._env.unwrapped if hasattr(self._env, "unwrapped") else self._env
+        space = unwrapped.single_action_space
         low = np.clip(space.low, -1.0, 1.0).astype(np.float32)
         high = np.clip(space.high, -1.0, 1.0).astype(np.float32)
         return gym.spaces.Box(low, high, dtype=np.float32)
