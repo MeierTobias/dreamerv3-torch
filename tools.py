@@ -18,6 +18,9 @@ from torch import distributions as torchd
 from torch.utils.tensorboard import SummaryWriter
 
 
+from tqdm import tqdm
+
+
 to_np = lambda x: x.detach().cpu().numpy()
 
 
@@ -73,7 +76,36 @@ class Logger:
         self._scalars = {}
         self._images = {}
         self._videos = {}
-        self.step = step
+        self._step = step
+        self._pbar = None
+        if config and hasattr(config, "steps") and hasattr(config, "eval_every"):
+            self._pbar = tqdm(
+                total=int(config.steps + config.eval_every),
+                initial=int(step),
+                unit="step",
+                dynamic_ncols=True,
+                position=0,
+                leave=True,
+            )
+
+    @property
+    def step(self):
+        return self._step
+
+    @step.setter
+    def step(self, value):
+        if self._pbar is not None:
+            delta = int(value) - int(self._step)
+            if delta > 0:
+                self._pbar.update(delta)
+        self._step = value
+
+    def print(self, msg):
+        """Print a message, routing through tqdm if the progress bar is active."""
+        if self._pbar is not None:
+            tqdm.write(msg)
+        else:
+            print(msg)
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
@@ -90,7 +122,8 @@ class Logger:
         scalars = list(self._scalars.items())
         if fps:
             scalars.append(("fps", self._compute_fps(step)))
-        print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
+        msg = f"[{step}] " + " / ".join(f"{k} {v:.1f}" for k, v in scalars)
+        self.print(msg)
         with (self._logdir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
         wlog = {"step": step, **dict(scalars)} if self._use_wandb else None
@@ -163,6 +196,9 @@ class Logger:
         return steps / duration
 
     def close(self, exit_code=0):
+        if self._pbar is not None:
+            self._pbar.close()
+            self._pbar = None
         self._writer.close()
         if self._use_wandb:
             wandb.finish(exit_code=exit_code)
