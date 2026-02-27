@@ -7,6 +7,7 @@ import pathlib
 import re
 import time
 import random
+import wandb
 
 import numpy as np
 
@@ -15,6 +16,9 @@ from torch import nn
 from torch.nn import functional as F
 from torch import distributions as torchd
 from torch.utils.tensorboard import SummaryWriter
+
+
+from tqdm import tqdm
 
 
 to_np = lambda x: x.detach().cpu().numpy()
@@ -55,15 +59,53 @@ class TimeRecording:
 
 
 class Logger:
-    def __init__(self, logdir, step):
+    def __init__(self, logdir, step, config=None):
         self._logdir = logdir
+        self._use_wandb = False
+        if config and getattr(config, "wandb_project", None):
+            wandb.init(
+                project=config.wandb_project,
+                dir=str(logdir),
+                config=vars(config) if hasattr(config, "__dict__") else {},
+            )
+            self._use_wandb = True
+
         self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
         self._last_step = None
         self._last_time = None
         self._scalars = {}
         self._images = {}
         self._videos = {}
-        self.step = step
+        self._step = step
+        self._pbar = None
+        if config and hasattr(config, "steps") and hasattr(config, "eval_every"):
+            self._pbar = tqdm(
+                total=int(config.steps + config.eval_every),
+                initial=int(step),
+                unit="step",
+                dynamic_ncols=True,
+                position=0,
+                leave=True,
+            )
+
+    @property
+    def step(self):
+        return self._step
+
+    @step.setter
+    def step(self, value):
+        if self._pbar is not None:
+            delta = int(value) - int(self._step)
+            if delta > 0:
+                self._pbar.update(delta)
+        self._step = value
+
+    def print(self, msg):
+        """Print a message, routing through tqdm if the progress bar is active."""
+        if self._pbar is not None:
+            tqdm.write(msg)
+        else:
+            print(msg)
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
@@ -80,9 +122,11 @@ class Logger:
         scalars = list(self._scalars.items())
         if fps:
             scalars.append(("fps", self._compute_fps(step)))
-        print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
+        msg = f"[{step}] " + " / ".join(f"{k} {v:.1f}" for k, v in scalars)
+        self.print(msg)
         with (self._logdir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
+        wlog = {"step": step, **dict(scalars)} if self._use_wandb else None
         for name, value in scalars:
             if "/" not in name:
                 self._writer.add_scalar("scalars/" + name, value, step)
@@ -90,15 +134,52 @@ class Logger:
                 self._writer.add_scalar(name, value, step)
         for name, value in self._images.items():
             self._writer.add_image(name, value, step)
+            if wlog is not None:
+                wlog[name] = wandb.Image(np.array(value))
         for name, value in self._videos.items():
             name = name if isinstance(name, str) else name.decode("utf-8")
             if np.issubdtype(value.dtype, np.floating):
                 value = np.clip(255 * value, 0, 255).astype(np.uint8)
             B, T, H, W, C = value.shape
+            if wlog is not None:
+                wlog[name] = wandb.Video(
+                    value[0].transpose(0, 3, 1, 2), fps=16, format="gif"
+                )
             value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-            self._writer.add_video(name, value, step, 16)
+            # moviepy v2 removed moviepy.editor, which TensorBoard's
+            # add_video relies on. Detect this and write the GIF directly.
+            _has_moviepy_editor = True
+            try:
+                from moviepy import editor as _mpy_check  # noqa: F401
+            except ImportError:
+                _has_moviepy_editor = False
+            if _has_moviepy_editor:
+                self._writer.add_video(name, value, step, 16)
+            else:
+                try:
+                    import moviepy
+                    import tempfile, os
+                    from torch.utils.tensorboard.summary import Summary
+                    frames = list(value[0].transpose(1, 2, 3, 0))
+                    clip = moviepy.ImageSequenceClip(frames, fps=16)
+                    tmp = tempfile.NamedTemporaryFile(suffix=".gif", delete=False)
+                    clip.write_gif(tmp.name, logger=None)
+                    with open(tmp.name, "rb") as f:
+                        encoded = f.read()
+                    os.remove(tmp.name)
+                    _, T2, C2, H2, W2 = value.shape
+                    summary_img = Summary.Image(
+                        height=H2, width=W2, colorspace=C2,
+                        encoded_image_string=encoded,
+                    )
+                    summary = Summary(value=[Summary.Value(tag=name, image=summary_img)])
+                    self._writer.file_writer.add_summary(summary, step)
+                except Exception as e:
+                    print(f"Warning: could not log video '{name}': {e}")
 
         self._writer.flush()
+        if wlog is not None:
+            wandb.log(wlog, commit=True)
         self._scalars = {}
         self._images = {}
         self._videos = {}
@@ -113,6 +194,14 @@ class Logger:
         self._last_time += duration
         self._last_step = step
         return steps / duration
+
+    def close(self, exit_code=0):
+        if self._pbar is not None:
+            self._pbar.close()
+            self._pbar = None
+        self._writer.close()
+        if self._use_wandb:
+            wandb.finish(exit_code=exit_code)
 
     def offline_scalar(self, name, value, step):
         self._writer.add_scalar("scalars/" + name, value, step)
@@ -245,6 +334,152 @@ def simulate(
         # keep only last item for saving memory. this cache is used for video_pred later
         while len(cache) > 1:
             # FIFO
+            cache.popitem(last=False)
+    return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
+
+
+def simulate_vec(
+    agent,
+    env,
+    cache,
+    directory,
+    logger,
+    is_eval=False,
+    limit=None,
+    steps=0,
+    episodes=0,
+    state=None,
+):
+    """Like simulate() but for a vectorized IsaacLab env.
+
+    The env handles all sub-envs in a single batched step on GPU.
+    Data stays as torch tensors until cache insertion.
+    """
+    num_envs = env.num_envs
+    has_image = "image" in env.observation_space.spaces
+
+    # initialize or unpack simulation state
+    if state is None:
+        step, episode = 0, 0
+        done = np.ones(num_envs, bool)
+        length = np.zeros(num_envs, np.int32)
+        obs = None
+        agent_state = None
+        reward = np.zeros(num_envs, np.float32)
+    else:
+        step, episode, done, length, obs, agent_state, reward = state
+
+    # initial reset
+    if obs is None:
+        obs = env.reset()
+        # cache initial observations
+        for i in range(num_envs):
+            t = {k: convert(v[i].cpu().numpy()) for k, v in obs.items()}
+            t["reward"] = 0.0
+            t["discount"] = 1.0
+            add_to_cache(cache, env.ids[i], t)
+
+    while (steps and step < steps) or (episodes and episode < episodes):
+        # stack obs for agent (already batched as torch tensors)
+        obs_agent = {k: v for k, v in obs.items() if "log_" not in k}
+        action, agent_state = agent(obs_agent, done, agent_state)
+        if isinstance(action, dict):
+            act_tensor = action["action"]
+        else:
+            act_tensor = action
+        if not isinstance(act_tensor, torch.Tensor):
+            act_tensor = torch.tensor(act_tensor, device=env._device)
+
+        # remember ids before step (done envs get new ids)
+        prev_ids = list(env.ids)
+
+        # step env
+        obs, reward_t, done_t, info = env.step(act_tensor)
+        done_np = done_t.cpu().numpy()
+        reward = reward_t.cpu().numpy()
+
+        # add transitions to cache
+        for i in range(num_envs):
+            t = {k: convert(v[i].cpu().numpy()) for k, v in obs.items()}
+            if isinstance(action, dict):
+                for k in action:
+                    t[k] = convert(action[k][i].detach().cpu().numpy())
+            else:
+                t["action"] = convert(act_tensor[i].detach().cpu().numpy())
+            t["reward"] = float(reward[i])
+            t["discount"] = float(info["discount"][i].cpu())
+            # use prev_ids: the transition belongs to the episode before auto-reset
+            add_to_cache(cache, prev_ids[i], t)
+
+        episode += int(done_np.sum())
+        length += 1
+        step += num_envs
+        length *= 1 - done_np
+
+        if done_np.any():
+            indices = [index for index, d in enumerate(done_np) if d]
+            for i in indices:
+                ep_id = prev_ids[i]
+                save_episodes(directory, {ep_id: cache[ep_id]})
+                ep_len = len(cache[ep_id]["reward"]) - 1
+                score = float(np.array(cache[ep_id]["reward"]).sum())
+                # record logs given from environments
+                for key in list(cache[ep_id].keys()):
+                    if "log_" in key:
+                        logger.scalar(key, float(np.array(cache[ep_id][key]).sum()))
+                        cache[ep_id].pop(key)
+
+                if not is_eval:
+                    step_in_dataset = erase_over_episodes(cache, limit)
+                    logger.scalar(f"dataset_size", step_in_dataset)
+                    logger.scalar(f"train_return", score)
+                    logger.scalar(f"train_length", ep_len)
+                    logger.scalar(f"train_episodes", len(cache))
+                    logger.write(step=logger.step)
+                else:
+                    if not "eval_lengths" in locals():
+                        eval_lengths = []
+                        eval_scores = []
+                        eval_done = False
+                    eval_scores.append(score)
+                    eval_lengths.append(ep_len)
+                    score = sum(eval_scores) / len(eval_scores)
+                    ep_len = sum(eval_lengths) / len(eval_lengths)
+                    if has_image:
+                        video = cache[ep_id]["image"]
+                        logger.video(f"eval_policy", np.array(video)[None])
+
+                    if len(eval_scores) >= episodes and not eval_done:
+                        logger.scalar(f"eval_return", score)
+                        logger.scalar(f"eval_length", ep_len)
+                        logger.scalar(f"eval_episodes", len(eval_scores))
+                        logger.write(step=logger.step)
+                        eval_done = True
+
+            # cache initial obs for new episodes (auto-reset already happened)
+            for i in indices:
+                t = {k: convert(v[i].cpu().numpy()) for k, v in obs.items()}
+                t["is_first"] = True
+                t["is_terminal"] = False
+                t["reward"] = 0.0
+                t["discount"] = 1.0
+                add_to_cache(cache, env.ids[i], t)
+
+            # update obs so agent sees is_first=True for auto-reset envs
+            obs["is_first"][indices] = True
+            obs["is_terminal"][indices] = False
+
+        done = done_np
+
+    if is_eval:
+        # Keep only one *completed* episode for video_pred.
+        # Auto-reset stubs (1-step initial obs) must be removed first,
+        # otherwise the trim would leave only a stub and sample_episodes
+        # would spin forever on the total < 2 check.
+        for key in list(cache.keys()):
+            if len(cache[key]["reward"]) < 2:
+                del cache[key]
+        while len(cache) > 1:
             cache.popitem(last=False)
     return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
 

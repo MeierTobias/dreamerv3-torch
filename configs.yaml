@@ -1,4 +1,5 @@
 defaults:
+  wandb_project: KLASK_Dreamer
 
   logdir: null
   traindir: null
@@ -175,6 +176,24 @@ memorymaze:
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   task: 'memorymaze_9x9'
+
+isaac_proprio:
+  steps: 5e5
+  action_repeat: 2
+  envs: 4
+  train_ratio: 512
+  video_pred_log: false
+  encoder: { mlp_keys: 'policy', cnn_keys: '$^' }
+  decoder: { mlp_keys: 'policy', cnn_keys: '$^' }
+
+isaac_vision:
+  steps: 5e5
+  action_repeat: 2
+  envs: 4
+  train_ratio: 512
+  video_pred_log: true
+  encoder: { mlp_keys: '$^', cnn_keys: 'image' }
+  decoder: { mlp_keys: '$^', cnn_keys: 'image' }
 
 debug:
   debug: True
